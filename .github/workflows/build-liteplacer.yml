@@ -1,0 +1,122 @@
+name: Build LitePlacer 01.11.2022
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build/liteplacer-2022
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out build repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Set up NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Fetch exact LitePlacer release source
+        shell: pwsh
+        run: |
+          git clone https://github.com/jkuusama/LitePlacer-DEV.git upstream
+          Set-Location upstream
+          git checkout 7d97082ce39ca30456e8cbbd6b719c770088e57f
+          git status --short
+          git log -1 --format="%H %s"
+
+      - name: Restore project packages
+        shell: pwsh
+        run: |
+          nuget restore upstream/LitePlacer.sln -PackagesDirectory upstream/packages -NonInteractive
+
+          # The historical project uses fixed relative HintPaths. Install the
+          # exact expected package versions explicitly so those paths exist.
+          nuget install Newtonsoft.Json `
+            -Version 12.0.2 `
+            -OutputDirectory upstream/packages `
+            -NonInteractive
+          nuget install MathNet.Numerics `
+            -Version 4.8.0 `
+            -OutputDirectory upstream/packages `
+            -NonInteractive
+
+          $newtonsoft = "upstream/packages/Newtonsoft.Json.12.0.2/lib/net40/Newtonsoft.Json.dll"
+          $mathnet = "upstream/packages/MathNet.Numerics.4.8.0/lib/net40/MathNet.Numerics.dll"
+          if (!(Test-Path $newtonsoft)) { throw "Missing $newtonsoft" }
+          if (!(Test-Path $mathnet)) { throw "Missing $mathnet" }
+
+      - name: Install .NET Framework 4.0 reference assemblies
+        shell: pwsh
+        run: |
+          nuget install Microsoft.NETFramework.ReferenceAssemblies.net40 `
+            -Version 1.0.3 `
+            -OutputDirectory refpacks `
+            -NonInteractive
+
+      - name: Build x86 Release
+        shell: pwsh
+        run: |
+          $refRoot = (Resolve-Path "refpacks/Microsoft.NETFramework.ReferenceAssemblies.net40.1.0.3/build").Path
+          msbuild upstream/LitePlacer.sln `
+            /m `
+            /t:Rebuild `
+            /p:Configuration=Release `
+            /p:Platform=x86 `
+            /p:TargetFrameworkRootPath="$refRoot\" `
+            /v:minimal `
+            /fl `
+            "/flp:logfile=build.log;verbosity=diagnostic"
+
+      - name: Assemble portable package
+        shell: pwsh
+        run: |
+          $output = "upstream/LitePlacer/bin/Release"
+          if (!(Test-Path "$output/LitePlacer.exe")) {
+            throw "LitePlacer.exe was not produced."
+          }
+
+          New-Item -ItemType Directory -Path package -Force | Out-Null
+          Copy-Item "$output/*" package -Recurse -Force
+          Copy-Item build.log package/build.log -Force
+
+          @"
+          LitePlacer 01.11.2022 - unofficial rebuild
+
+          Source repository: https://github.com/jkuusama/LitePlacer-DEV
+          Source commit: 7d97082ce39ca30456e8cbbd6b719c770088e57f
+
+          This is an unsigned portable build, not the original LitePlacer installer.
+          Start the application using LitePlacer.exe.
+          "@ | Set-Content package/BUILD_INFO.txt
+
+          Get-FileHash package/LitePlacer.exe -Algorithm SHA256 |
+            Format-List | Out-File package/SHA256.txt
+
+      - name: Upload portable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: LitePlacer-01.11.2022-portable
+          path: package
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LitePlacer-build-diagnostics
+          path: |
+            build.log
+            upstream/**/*.csproj
+            upstream/**/packages.config
+          if-no-files-found: ignore
+          retention-days: 30
